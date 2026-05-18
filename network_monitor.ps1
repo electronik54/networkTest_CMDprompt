@@ -335,6 +335,17 @@ if ($null -ne $cfg -and $null -ne $cfg.pingTest) {
         $delayAfterSummaryMs = [int]$cfg.pingTest.delayAfterSummarySeconds * 1000
     }
 }
+
+# Current schema: top-level summary
+if ($null -ne $cfg -and $null -ne $cfg.summary) {
+    if ($null -ne $cfg.summary.summaryAfterPings -and [int]$cfg.summary.summaryAfterPings -gt 0) {
+        $monitorInterval = [int]$cfg.summary.summaryAfterPings
+    }
+    if ($null -ne $cfg.summary.delayAfterSummarySeconds -and [int]$cfg.summary.delayAfterSummarySeconds -ge 0) {
+        $delayAfterSummaryMs = [int]$cfg.summary.delayAfterSummarySeconds * 1000
+    }
+}
+
 if ($null -ne $cfg -and $null -ne $cfg.speedtest) {
     if ($null -ne $cfg.speedtest.serverId) {
         $sid = [string]$cfg.speedtest.serverId

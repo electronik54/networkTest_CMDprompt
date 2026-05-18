@@ -10,11 +10,7 @@
   },
   "pingTest": {
     "enabled": true,
-    "pingIntervalMilSeconds": 10,    
-    "summary": {
-      "summaryAfterPings": 100,
-      "delayAfterSummarySeconds": 2
-    },
+    "pingIntervalMilSeconds": 10,
     "ignoreGoogleDns": false,
     "pingTargets": [
       {
@@ -26,5 +22,9 @@
         "host": "192.168.2.1"
       }
     ]
+  },
+  "summary": {
+    "summaryAfterPings": 100,
+    "delayAfterSummarySeconds": 2
   }
 }
