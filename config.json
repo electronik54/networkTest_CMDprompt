@@ -1,0 +1,27 @@
+{
+  "speedtest": {
+    "enabled": false,
+    "serverId": null,
+    "summaryAfterSeconds": 10,
+    "runOnStart": false,
+    "rateLimitCooldownSeconds": 1800,
+    "autoInstallCli": true,
+    "cliPath": null,
+    "cliDownloadUrl": "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-win64.zip"
+  },
+  "pingTest": {
+    "enabled": true,
+    "monitorIntervalSecond": 30,
+    "ignoreGoogleDns": false,
+    "pingTargets": [
+      {
+        "name": "Cloudflare DNS",
+        "host": "1.1.1.1"
+      },
+      {
+        "name": "Home Gateway",
+        "host": "192.168.2.1"
+      }
+    ]
+  }
+}
