@@ -2,7 +2,6 @@
   "speedtest": {
     "enabled": false,
     "serverId": null,
-    "summaryAfterSeconds": 10,
     "runOnStart": false,
     "rateLimitCooldownSeconds": 1800,
     "autoInstallCli": true,
@@ -11,7 +10,11 @@
   },
   "pingTest": {
     "enabled": true,
-    "monitorIntervalSecond": 30,
+    "pingIntervalMilSeconds": 10,    
+    "summary": {
+      "summaryAfterPings": 100,
+      "delayAfterSummarySeconds": 2
+    },
     "ignoreGoogleDns": false,
     "pingTargets": [
       {

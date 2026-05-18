@@ -257,11 +257,12 @@ if ($targets.Count -eq 0) {
 }
 
 # Read test settings from the already-parsed config (no second file read)
-$doPingTest      = $true
-$doSpeedtest     = $false
-$monitorInterval = 60
+$doPingTest           = $true
+$doSpeedtest          = $false
+$monitorInterval      = 60
+$pingIntervalMs       = 1000
+$delayAfterSummaryMs  = 2000
 $speedtestServerId = $null
-$speedtestInterval = 600
 $speedtestRunOnStart = $false
 $speedtestRateLimitCooldownSeconds = 1800
 $speedtestCliPath = $null
@@ -307,21 +308,37 @@ if ($null -ne $cfg -and $null -ne $cfg.pingTest) {
     if ($null -ne $cfg.pingTest.enabled) {
         try { $doPingTest = [bool]$cfg.pingTest.enabled } catch {}
     }
-    if ($null -ne $cfg.pingTest.monitorIntervalSecond -and [int]$cfg.pingTest.monitorIntervalSecond -gt 0) {
+    if ($null -ne $cfg.pingTest.summary) {
+        if ($null -ne $cfg.pingTest.summary.summaryAfterPings -and [int]$cfg.pingTest.summary.summaryAfterPings -gt 0) {
+            $monitorInterval = [int]$cfg.pingTest.summary.summaryAfterPings
+        }
+        if ($null -ne $cfg.pingTest.summary.delayAfterSummarySeconds -and [int]$cfg.pingTest.summary.delayAfterSummarySeconds -ge 0) {
+            $delayAfterSummaryMs = [int]$cfg.pingTest.summary.delayAfterSummarySeconds * 1000
+        }
+    }
+    # Backward compatibility: flat keys
+    if ($null -ne $cfg.pingTest.summaryAfterPings -and [int]$cfg.pingTest.summaryAfterPings -gt 0) {
+        $monitorInterval = [int]$cfg.pingTest.summaryAfterPings
+    }
+    elseif ($null -ne $cfg.pingTest.summaryAfterSeconds -and [int]$cfg.pingTest.summaryAfterSeconds -gt 0) {
+        # Backward compatibility with old key name
+        $monitorInterval = [int]$cfg.pingTest.summaryAfterSeconds
+    }
+    elseif ($null -ne $cfg.pingTest.monitorIntervalSecond -and [int]$cfg.pingTest.monitorIntervalSecond -gt 0) {
+        # Backward compatibility with old key name
         $monitorInterval = [int]$cfg.pingTest.monitorIntervalSecond
+    }
+    if ($null -ne $cfg.pingTest.pingIntervalMilSeconds -and [int]$cfg.pingTest.pingIntervalMilSeconds -ge 0) {
+        $pingIntervalMs = [int]$cfg.pingTest.pingIntervalMilSeconds
+    }
+    if ($null -ne $cfg.pingTest.delayAfterSummarySeconds -and [int]$cfg.pingTest.delayAfterSummarySeconds -ge 0) {
+        $delayAfterSummaryMs = [int]$cfg.pingTest.delayAfterSummarySeconds * 1000
     }
 }
 if ($null -ne $cfg -and $null -ne $cfg.speedtest) {
     if ($null -ne $cfg.speedtest.serverId) {
         $sid = [string]$cfg.speedtest.serverId
         if (-not [string]::IsNullOrWhiteSpace($sid)) { $speedtestServerId = $sid }
-    }
-    if ($null -ne $cfg.speedtest.summaryAfterSeconds -and [int]$cfg.speedtest.summaryAfterSeconds -gt 0) {
-        $speedtestInterval = [int]$cfg.speedtest.summaryAfterSeconds
-    }
-    elseif ($null -ne $cfg.speedtest.intervalSecond -and [int]$cfg.speedtest.intervalSecond -gt 0) {
-        # Backward compatibility with old key name
-        $speedtestInterval = [int]$cfg.speedtest.intervalSecond
     }
     if ($null -ne $cfg.speedtest.runOnStart) {
         try { $speedtestRunOnStart = [bool]$cfg.speedtest.runOnStart } catch {}
@@ -352,13 +369,6 @@ elseif ($null -ne $cfg -and $null -ne $cfg.speedTestTarget) {
         $sid = [string]$cfg.speedTestTarget.serverId
         if (-not [string]::IsNullOrWhiteSpace($sid)) { $speedtestServerId = $sid }
     }
-    if ($null -ne $cfg.speedTestTarget.summaryAfterSeconds -and [int]$cfg.speedTestTarget.summaryAfterSeconds -gt 0) {
-        $speedtestInterval = [int]$cfg.speedTestTarget.summaryAfterSeconds
-    }
-    elseif ($null -ne $cfg.speedTestTarget.intervalSecond -and [int]$cfg.speedTestTarget.intervalSecond -gt 0) {
-        # Backward compatibility with old key name
-        $speedtestInterval = [int]$cfg.speedTestTarget.intervalSecond
-    }
     if ($null -ne $cfg.speedTestTarget.runOnStart) {
         try { $speedtestRunOnStart = [bool]$cfg.speedTestTarget.runOnStart } catch {}
     }
@@ -378,31 +388,14 @@ if ($doSpeedtest) {
 }
 
 $speedtestNextAllowedAt = Get-Date
-$speedtestNextRunAt = (Get-Date).AddSeconds($speedtestInterval)
 
-Write-Colored ("Ping test: {0} | Speedtest: {1} | Summary interval: {2}s" -f $doPingTest, $doSpeedtest, $monitorInterval) Cyan
+Write-Colored ("Ping test: {0} | Speedtest: {1} | Summary interval: {2}s | Ping interval: {3}ms | Delay after summary: {4}ms" -f $doPingTest, $doSpeedtest, $monitorInterval, $pingIntervalMs, $delayAfterSummaryMs) Cyan
 Write-Colored ("Targets: {0}" -f (($targets | ForEach-Object { "{0} ({1})" -f $_.name, $_.targetHost }) -join " - ")) Cyan
 if ($doSpeedtest) {
-    Write-Colored ("Speedtest interval: {0}s | Run on start: {1} | Rate-limit cooldown: {2}s" -f $speedtestInterval, $speedtestRunOnStart, $speedtestRateLimitCooldownSeconds) Cyan
+    Write-Colored ("Speedtest trigger: with each displayed summary | Run on start: {0} | Rate-limit cooldown: {1}s" -f $speedtestRunOnStart, $speedtestRateLimitCooldownSeconds) Cyan
     $configuredServerIdText = if (-not [string]::IsNullOrWhiteSpace($speedtestServerId)) { $speedtestServerId } else { 'auto' }
     Write-Colored ("Speedtest configured server ID: {0}" -f $configuredServerIdText) Cyan
     Write-Colored ("Speedtest CLI path: {0}" -f $speedtestExePath) Cyan
-}
-
-# --- Run speedtest once before the ping loop ---
-if ($doSpeedtest -and $speedtestRunOnStart) {
-    Write-Host ""
-    Write-Host "=== Running Speedtest ==="
-    $stResult = Invoke-Speedtest -ServerId $speedtestServerId -SpeedtestExePath $speedtestExePath
-    Write-Host ("> Speedtest | DL:{0}Mbps  UL:{1}Mbps" -f $stResult.Download, $stResult.Upload)
-    $speedtestNextRunAt = (Get-Date).AddSeconds($speedtestInterval)
-    if ($stResult.RateLimited) {
-        $speedtestNextAllowedAt = (Get-Date).AddSeconds($speedtestRateLimitCooldownSeconds)
-        if ($speedtestNextRunAt -lt $speedtestNextAllowedAt) {
-            $speedtestNextRunAt = $speedtestNextAllowedAt
-        }
-        Write-Colored ("> Speedtest cooldown active until {0}" -f $speedtestNextAllowedAt.ToString("HH:mm:ss")) Yellow
-    }
 }
 
 # --- Main Loop ---
@@ -415,9 +408,6 @@ while ($true) {
         }
 
         $timestamp = Get-Date -Format "HH:mm:ss"
-        # StringBuilder avoids repeated string allocations per ping cycle
-        $sb    = [System.Text.StringBuilder]::new()
-        [void]$sb.Append("$timestamp ")
 
         # Pre-sized List avoids array copy-on-write overhead when adding tasks
         $tasks = [System.Collections.Generic.List[object]]::new($targets.Count)
@@ -443,6 +433,7 @@ while ($true) {
 
         [Threading.Tasks.Task]::WaitAll(($tasks | ForEach-Object { $_.Task }))
 
+        Write-Host "$timestamp " -NoNewline
         foreach ($entry in $tasks) {
             $t     = $entry.Target
             $s     = $state[$t.targetHost]
@@ -457,13 +448,20 @@ while ($true) {
                 $s.latHistory.Add($lat)
                 $s.jitHistory.Add($jit)
                 $s.lossHistory.Add($loss)
-                [void]$sb.Append(("[{0}|T:{1}ms|J:{2}ms|L:{3}%]" -f $t.name, $lat, $jit, $loss))
+                $latTag  = Get-RateTag $lat  40 80
+                $jitTag  = Get-RateTag $jit  15 30
+                $lossTag = Get-RateTag $loss  0  1
+                Write-Host "[" -NoNewline
+                Write-Host $t.name -NoNewline
+                Write-Host ("|T:{0}ms" -f $lat)  -ForegroundColor $latTag.color  -NoNewline
+                Write-Host ("|J:{0}ms" -f $jit)  -ForegroundColor $jitTag.color  -NoNewline
+                Write-Host ("|L:{0}%]" -f $loss) -ForegroundColor $lossTag.color -NoNewline
             } else {
                 $loss = [math]::Round((($s.sent - $s.recv) / $s.sent) * 100, 2)
                 $s.latHistory.Add(999)
                 $s.jitHistory.Add(0)
                 $s.lossHistory.Add($loss)
-                [void]$sb.Append(("[{0}|timeout|L:{1}%]" -f $t.name, $loss))
+                Write-Host ("[{0}|timeout|L:{1}%]" -f $t.name, $loss) -ForegroundColor Red -NoNewline
             }
 
             # Dispose Ping to free the underlying socket immediately
@@ -474,8 +472,7 @@ while ($true) {
             if ($s.jitHistory.Count  -gt $monitorInterval) { $s.jitHistory.RemoveAt(0)  }
             if ($s.lossHistory.Count -gt $monitorInterval) { $s.lossHistory.RemoveAt(0) }
         }
-
-        Write-Host $sb.ToString()
+        Write-Host ""
     }
 
     # --- Every N seconds: print per-target summaries and run speedtest ---
@@ -507,17 +504,15 @@ while ($true) {
             Write-Host ""
         }
 
-        $counter = 0
-    }
+        if ($delayAfterSummaryMs -gt 0) {
+            Start-Sleep -Milliseconds $delayAfterSummaryMs
+        }
 
-    # Speedtest scheduler (independent from ping summary interval)
-    if ($doSpeedtest) {
-        $now = Get-Date
-        if ($now -ge $speedtestNextRunAt) {
+        if ($doSpeedtest -and $doPingTest) {
+            $now = Get-Date
             if ($now -lt $speedtestNextAllowedAt) {
                 $remaining = [math]::Max(1, [int](($speedtestNextAllowedAt - $now).TotalSeconds))
                 Write-Colored ("> Speedtest skipped: cooldown active ({0}s remaining)" -f $remaining) Yellow
-                $speedtestNextRunAt = $speedtestNextAllowedAt
             }
             else {
                 Write-Host ""
@@ -525,17 +520,17 @@ while ($true) {
                 $stResult = Invoke-Speedtest -ServerId $speedtestServerId -SpeedtestExePath $speedtestExePath
                 Write-Host ("> Speedtest | DL:{0}Mbps  UL:{1}Mbps" -f $stResult.Download, $stResult.Upload)
 
-                $speedtestNextRunAt = (Get-Date).AddSeconds($speedtestInterval)
                 if ($stResult.RateLimited) {
                     $speedtestNextAllowedAt = (Get-Date).AddSeconds($speedtestRateLimitCooldownSeconds)
-                    if ($speedtestNextRunAt -lt $speedtestNextAllowedAt) {
-                        $speedtestNextRunAt = $speedtestNextAllowedAt
-                    }
                     Write-Colored ("> Speedtest cooldown active until {0}" -f $speedtestNextAllowedAt.ToString("HH:mm:ss")) Yellow
                 }
             }
         }
+
+        $counter = 0
     }
 
-    Start-Sleep -Seconds 1
+    if ($pingIntervalMs -gt 0) {
+        Start-Sleep -Milliseconds $pingIntervalMs
+    }
 }

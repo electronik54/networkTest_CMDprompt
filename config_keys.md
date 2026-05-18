@@ -10,8 +10,7 @@ Speedtest CLI settings.
 - `enabled`: Enable or disable speedtest runs.
 - `serverId`: Optional single Ookla server ID.
   - `null` means use automatic server selection.
-- `summaryAfterSeconds`: How often to run speedtest (seconds).
-- `runOnStart`: If `true`, run speedtest once at startup.
+- `runOnStart`: Legacy startup option. Speedtest now runs only when summary is displayed.
 - `rateLimitCooldownSeconds`: Cooldown duration after a 429/rate-limit response.
 - `autoInstallCli`: If `true`, auto-download and install Speedtest CLI when missing.
 - `cliPath`: Optional explicit path to speedtest.exe.
@@ -22,7 +21,6 @@ Example:
 "speedtest": {
   "enabled": true,
   "serverId": null,
-  "summaryAfterSeconds": 600,
   "runOnStart": false,
   "rateLimitCooldownSeconds": 1800,
   "autoInstallCli": true,
@@ -48,7 +46,7 @@ Example:
 Ping monitoring settings.
 
 - `enabled`: Enable or disable ping monitoring output.
-- `monitorIntervalSecond`: Summary interval for ping sections and loop-based timers.
+- `summaryAfterPings`: How many pings to run between each summary display.
 - `ignoreGoogleDns`: If `true`, do not auto-add Google DNS (`8.8.8.8`). If `false`, auto-add when missing.
 - `pingTargets`: Array of ping targets.
   - `name`: Display name shown in output.
@@ -58,7 +56,7 @@ Example:
 ```json
 "pingTest": {
   "enabled": true,
-  "monitorIntervalSecond": 60,
+  "summaryAfterPings": 60,
   "ignoreGoogleDns": false,
   "pingTargets": [
     { "name": "Cloudflare DNS", "host": "1.1.1.1" },
@@ -70,6 +68,7 @@ Example:
 ## Notes
 
 - Speedtest CLI is resolved from `speedtest.cliPath`, a bundled `speedtest.exe` beside the app/script, `%LocalAppData%\network-monitor\tools\speedtest.exe`, PATH, or auto-downloaded when `speedtest.autoInstallCli` is true.
-- `intervalSecond` is still accepted for backward compatibility, but `summaryAfterSeconds` is preferred.
+- `monitorIntervalSecond` and `summaryAfterSeconds` are still accepted for backward compatibility, but `pingTest.summaryAfterPings` is preferred.
+- `intervalSecond` is still accepted for backward compatibility in legacy `speedTestTarget`, but speedtests now run only on summary display.
 - `cooldownAfter429Second` is still accepted for backward compatibility, but `rateLimitCooldownSeconds` is preferred.
 - Current script includes backward compatibility for legacy keys (`log`, `speedTestTarget`, `tests.doSpeedtest`, `tests.doPingTest`, `tests.monitorIntervalSecond`, top-level `ignoreGoogleDns`, and top-level `pingTargets`).
