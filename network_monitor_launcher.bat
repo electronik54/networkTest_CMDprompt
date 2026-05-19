@@ -24,8 +24,7 @@ exit /b %ERRORLEVEL%
 :__PWSH_BEGIN__
 # ============================
 # Network Monitor (Async Multi-Target, Per-Target Summaries)
-# - Default Google DNS hard-coded
-# - Honors config.json "ignoreGoogleDns" key
+# - Targets are primarily configured in config.json pingTest.pingTargets
 # ============================
 
 # --- Configuration ---
@@ -184,7 +183,7 @@ function Invoke-Speedtest {
     return $result
 }
 
-# Loads targets from config.json and applies ignoreGoogleDns/default-target rules.
+# Loads targets from config.json and applies enabled-target rules.
 # Returns a result object with Targets array and parsed Config for reuse (avoids double file read).
 function Load-Config {
     param($path)
@@ -197,16 +196,8 @@ function Load-Config {
     try {
         $json = Get-Content $path -Raw | ConvertFrom-Json
 
-        $ignoreGoogle = $false
-        if ($null -ne $json.pingTest -and $null -ne $json.pingTest.ignoreGoogleDns) {
-            try { $ignoreGoogle = [bool]$json.pingTest.ignoreGoogleDns } catch {}
-        }
-        elseif ($null -ne $json.ignoreGoogleDns) {
-            # Backward compatibility with legacy top-level key
-            try { $ignoreGoogle = [bool]$json.ignoreGoogleDns } catch {}
-        }
-
         $list = [System.Collections.Generic.List[object]]::new()
+        $hasConfiguredTargets = $false
         $pingTargets = $null
         if ($null -ne $json.pingTest -and $null -ne $json.pingTest.pingTargets) {
             $pingTargets = $json.pingTest.pingTargets
@@ -217,25 +208,27 @@ function Load-Config {
         }
 
         if ($null -ne $pingTargets) {
+            $hasConfiguredTargets = $true
             foreach ($t in $pingTargets) {
                 if (-not $t.host) { continue }
                 $name = if ($t.name) { $t.name } else { $t.host }
-                if ($ignoreGoogle -and ($t.host -eq $defaultPrimary.targetHost -or $name -match 'Google\s*DNS')) { continue }
-                $list.Add([PSCustomObject]@{ name = $name; targetHost = $t.host })
-            }
-        }
-
-        if (-not $ignoreGoogle) {
-            $alreadyPresent = $list | Where-Object { $_.targetHost -eq $defaultPrimary.targetHost }
-            if (-not $alreadyPresent) {
-                $list.Insert(0, $defaultPrimary)
-                Write-Colored ("Auto-added {0} ({1}) because ignoreGoogleDns is false" -f $defaultPrimary.name, $defaultPrimary.targetHost) Cyan
+                $targetEnabled = $true
+                if ($null -ne $t.enabled) {
+                    try { $targetEnabled = [bool]$t.enabled } catch {}
+                }
+                if (-not $targetEnabled) { continue }
+                $list.Add([PSCustomObject]@{
+                    name = $name
+                    targetHost = $t.host
+                    timeoutMs = $t.timeoutMs
+                    avgLatencyThresholdMs = $t.avgLatencyThresholdMs
+                    avgJitterThresholdMs = $t.avgJitterThresholdMs
+                })
             }
         }
 
         if ($list.Count -eq 0) {
-            if ($ignoreGoogle) {
-                Write-Colored "Config contains no targets and ignoreGoogleDns is true. No targets to monitor. Exiting." Red
+            if ($hasConfiguredTargets) {
                 return [PSCustomObject]@{ Targets = @(); Config = $json }
             }
             Write-Colored ("Config contains no targets - using default target {0}" -f $defaultPrimary.targetHost) Yellow
@@ -610,19 +603,15 @@ $targets   = $cfgResult.Targets
 $cfg       = $cfgResult.Config
 $cfgResult = $null   # release wrapper
 
-if ($null -eq $targets -or $targets.Count -eq 0) {
-    Write-Colored "No targets configured. Exiting." Red
-    exit 1
+if ($null -eq $targets) {
+    $targets = @()
 }
 
-# Deduplicate by address using a HashSet (O(1) lookup, no extra hashtable overhead)
-$seen    = [System.Collections.Generic.HashSet[string]]::new()
-$targets = @($targets | Where-Object { $seen.Add($_.targetHost) })
-$seen    = $null   # free immediately
-
-if ($targets.Count -eq 0) {
-    Write-Colored "No targets remaining after deduplication. Exiting." Red
-    exit 1
+if ($targets.Count -gt 0) {
+    # Deduplicate by address using a HashSet (O(1) lookup, no extra hashtable overhead)
+    $seen    = [System.Collections.Generic.HashSet[string]]::new()
+    $targets = @($targets | Where-Object { $seen.Add($_.targetHost) })
+    $seen    = $null   # free immediately
 }
 
 # Read test settings from the already-parsed config (no second file read)
@@ -645,7 +634,13 @@ $healthTcpTargets = @(
     [PSCustomObject]@{ host = '1.1.1.1'; port = 443 },
     [PSCustomObject]@{ host = '8.8.8.8'; port = 443 }
 )
+$healthDnsHostsTotalCount = $healthDnsHosts.Count
+$healthDnsHostsEnabledCount = $healthDnsHosts.Count
+$healthTcpTargetsTotalCount = $healthTcpTargets.Count
+$healthTcpTargetsEnabledCount = $healthTcpTargets.Count
 $healthHttpUrls = @('https://www.msftconnecttest.com/connecttest.txt')
+$healthHttpUrlsTotalCount = $healthHttpUrls.Count
+$healthHttpUrlsEnabledCount = $healthHttpUrls.Count
 $healthTcpTimeoutMs = 2000
 $healthHttpTimeoutSeconds = 5
 $incidentDiagnosticsEnabled = $true
@@ -781,30 +776,91 @@ elseif ($null -ne $cfg -and $null -ne $cfg.speedTestTarget) {
     }
 }
 
-if ($null -ne $cfg -and $null -ne $cfg.healthChecks) {
-    if ($null -ne $cfg.healthChecks.enabled) {
-        try { $healthChecksEnabled = [bool]$cfg.healthChecks.enabled } catch {}
+ $healthChecksCfg = $null
+if ($null -ne $cfg -and $null -ne $cfg.pingTest -and $null -ne $cfg.pingTest.healthChecks) {
+    $healthChecksCfg = $cfg.pingTest.healthChecks
+}
+elseif ($null -ne $cfg -and $null -ne $cfg.healthChecks) {
+    # Backward compatibility with legacy top-level key
+    $healthChecksCfg = $cfg.healthChecks
+}
+
+if ($null -ne $healthChecksCfg) {
+    if ($null -ne $healthChecksCfg.enabled) {
+        try { $healthChecksEnabled = [bool]$healthChecksCfg.enabled } catch {}
     }
-    if ($null -ne $cfg.healthChecks.dnsHosts) {
-        $healthDnsHosts = @($cfg.healthChecks.dnsHosts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+    if ($null -ne $healthChecksCfg.dnsHosts) {
+        $parsedDnsHosts = [System.Collections.Generic.List[string]]::new()
+        $healthDnsHostsTotalCount = 0
+        foreach ($dh in $healthChecksCfg.dnsHosts) {
+            $healthDnsHostsTotalCount++
+            $dnsHost = $null
+            $dnsEnabled = $true
+
+            if ($dh -is [string]) {
+                $dnsHost = [string]$dh
+            }
+            else {
+                if ($null -eq $dh) { continue }
+                $dnsHost = [string]$dh.host
+                if ($null -ne $dh.enabled) {
+                    try { $dnsEnabled = [bool]$dh.enabled } catch {}
+                }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($dnsHost)) { continue }
+            if ($dnsEnabled) { $parsedDnsHosts.Add($dnsHost) }
+        }
+        $healthDnsHosts = $parsedDnsHosts.ToArray()
+        $healthDnsHostsEnabledCount = $healthDnsHosts.Count
     }
-    if ($null -ne $cfg.healthChecks.tcpTargets) {
+    if ($null -ne $healthChecksCfg.tcpTargets) {
         $parsedTcpTargets = [System.Collections.Generic.List[object]]::new()
-        foreach ($tt in $cfg.healthChecks.tcpTargets) {
+        $healthTcpTargetsTotalCount = 0
+        foreach ($tt in $healthChecksCfg.tcpTargets) {
+            $healthTcpTargetsTotalCount++
             if ($null -eq $tt -or [string]::IsNullOrWhiteSpace([string]$tt.host)) { continue }
+            $tcpEnabled = $true
+            if ($null -ne $tt.enabled) {
+                try { $tcpEnabled = [bool]$tt.enabled } catch {}
+            }
+            if (-not $tcpEnabled) { continue }
             $port = if ($null -ne $tt.port -and [int]$tt.port -gt 0) { [int]$tt.port } else { 443 }
             $parsedTcpTargets.Add([PSCustomObject]@{ host = [string]$tt.host; port = $port })
         }
         $healthTcpTargets = $parsedTcpTargets.ToArray()
+        $healthTcpTargetsEnabledCount = $healthTcpTargets.Count
     }
-    if ($null -ne $cfg.healthChecks.httpUrls) {
-        $healthHttpUrls = @($cfg.healthChecks.httpUrls | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+    if ($null -ne $healthChecksCfg.httpUrls) {
+        $parsedHttpUrls = [System.Collections.Generic.List[string]]::new()
+        $healthHttpUrlsTotalCount = 0
+        foreach ($hu in $healthChecksCfg.httpUrls) {
+            $healthHttpUrlsTotalCount++
+            $httpUrl = $null
+            $httpEnabled = $true
+
+            if ($hu -is [string]) {
+                $httpUrl = [string]$hu
+            }
+            else {
+                if ($null -eq $hu) { continue }
+                $httpUrl = [string]$hu.url
+                if ($null -ne $hu.enabled) {
+                    try { $httpEnabled = [bool]$hu.enabled } catch {}
+                }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($httpUrl)) { continue }
+            if ($httpEnabled) { $parsedHttpUrls.Add($httpUrl) }
+        }
+        $healthHttpUrls = $parsedHttpUrls.ToArray()
+        $healthHttpUrlsEnabledCount = $healthHttpUrls.Count
     }
-    if ($null -ne $cfg.healthChecks.tcpTimeoutMs -and [int]$cfg.healthChecks.tcpTimeoutMs -gt 0) {
-        $healthTcpTimeoutMs = [int]$cfg.healthChecks.tcpTimeoutMs
+    if ($null -ne $healthChecksCfg.tcpTimeoutMs -and [int]$healthChecksCfg.tcpTimeoutMs -gt 0) {
+        $healthTcpTimeoutMs = [int]$healthChecksCfg.tcpTimeoutMs
     }
-    if ($null -ne $cfg.healthChecks.httpTimeoutSeconds -and [int]$cfg.healthChecks.httpTimeoutSeconds -gt 0) {
-        $healthHttpTimeoutSeconds = [int]$cfg.healthChecks.httpTimeoutSeconds
+    if ($null -ne $healthChecksCfg.httpTimeoutSeconds -and [int]$healthChecksCfg.httpTimeoutSeconds -gt 0) {
+        $healthHttpTimeoutSeconds = [int]$healthChecksCfg.httpTimeoutSeconds
     }
 }
 
@@ -851,7 +907,8 @@ if ($doSpeedtest) {
 $speedtestNextAllowedAt = Get-Date
 
 Write-Colored ("Ping test: {0} | Speedtest: {1} | Summary after: {2} pings | Ping interval: {3}ms | Ping timeout: {4}ms | Delay after summary: {5}ms" -f $doPingTest, $doSpeedtest, $monitorInterval, $pingIntervalMs, $pingTimeoutMs, $delayAfterSummaryMs) Cyan
-Write-Colored ("Targets: {0}" -f (($targets | ForEach-Object { "{0} ({1})" -f $_.name, $_.targetHost }) -join " - ")) Cyan
+$targetSummaryText = if ($targets.Count -gt 0) { (($targets | ForEach-Object { "{0} ({1})" -f $_.name, $_.targetHost }) -join " - ") } else { 'none' }
+Write-Colored ("Targets: {0}" -f $targetSummaryText) Cyan
 Write-Colored ("Incident diagnostics: {0} | Loss>={1}% Latency>={2}ms Jitter>={3}ms | Consecutive summaries: {4} | Cooldown: {5}s" -f $incidentDiagnosticsEnabled, $incidentLossThresholdPercent, $incidentAvgLatencyThresholdMs, $incidentAvgJitterThresholdMs, $incidentConsecutiveBreachSummaries, $incidentCooldownSeconds) Cyan
 Write-Colored ("Service checks: {0} | DNS:{1} TCP:{2} HTTP:{3}" -f $healthChecksEnabled, $healthDnsHosts.Count, $healthTcpTargets.Count, $healthHttpUrls.Count) Cyan
 if ($doSpeedtest) {
@@ -859,6 +916,76 @@ if ($doSpeedtest) {
     $configuredServerIdText = if (-not [string]::IsNullOrWhiteSpace($speedtestServerId)) { $speedtestServerId } else { 'auto' }
     Write-Colored ("Speedtest configured server ID: {0}" -f $configuredServerIdText) Cyan
     Write-Colored ("Speedtest CLI path: {0}" -f $speedtestExePath) Cyan
+}
+
+# Startup confirmation before beginning any tests.
+$testsToRun = [System.Collections.Generic.List[string]]::new()
+$runWarnings = [System.Collections.Generic.List[string]]::new()
+$enabledPingTargetsCount = $targets.Count
+$enabledHealthTargetsCount = $healthDnsHosts.Count + $healthTcpTargets.Count + $healthHttpUrls.Count
+
+$effectivePingTest = ($doPingTest -and $enabledPingTargetsCount -gt 0)
+$effectiveSpeedtest = ($doSpeedtest -and $effectivePingTest)
+$effectiveHealthChecks = ($healthChecksEnabled -and $effectivePingTest -and $enabledHealthTargetsCount -gt 0)
+
+if ($doPingTest -and $enabledPingTargetsCount -eq 0) {
+    $runWarnings.Add("pingTest is enabled, but no pingTargets are enabled.")
+}
+if ($healthChecksEnabled -and $enabledHealthTargetsCount -eq 0) {
+    $runWarnings.Add("healthChecks is enabled, but no DNS/TCP/HTTP health targets are enabled.")
+}
+if ($healthChecksEnabled -and $healthDnsHostsTotalCount -gt 0 -and $healthDnsHostsEnabledCount -eq 0) {
+    $runWarnings.Add("healthChecks dnsHosts are configured, but all dnsHosts are disabled.")
+}
+if ($healthChecksEnabled -and $healthTcpTargetsTotalCount -gt 0 -and $healthTcpTargetsEnabledCount -eq 0) {
+    $runWarnings.Add("healthChecks tcpTargets are configured, but all tcpTargets are disabled.")
+}
+if ($healthChecksEnabled -and $healthHttpUrlsTotalCount -gt 0 -and $healthHttpUrlsEnabledCount -eq 0) {
+    $runWarnings.Add("healthChecks httpUrls are configured, but all httpUrls are disabled.")
+}
+
+if ($effectivePingTest) { $testsToRun.Add('pingTest') }
+if ($effectiveSpeedtest) { $testsToRun.Add('speedtest') }
+if ($effectiveHealthChecks) { $testsToRun.Add('healthChecks') }
+
+Write-Host ""
+Write-Host "=== Planned Run ===" -ForegroundColor Cyan
+Write-Host "Ping targets to test:" -ForegroundColor Cyan
+if ($targets.Count -gt 0) {
+    foreach ($t in $targets) {
+        $targetTimeoutText = if ($null -ne $t.timeoutMs -and [int]$t.timeoutMs -gt 0) { [string]([int]$t.timeoutMs) } else { [string]$pingTimeoutMs }
+        $latThresholdText = if ($null -ne $t.avgLatencyThresholdMs) { [string]$t.avgLatencyThresholdMs } else { [string]$incidentAvgLatencyThresholdMs }
+        $jitThresholdText = if ($null -ne $t.avgJitterThresholdMs) { [string]$t.avgJitterThresholdMs } else { [string]$incidentAvgJitterThresholdMs }
+        Write-Host (" - {0} ({1}) | Timeout:{2}ms | Thresholds: Latency>={3}ms, Jitter>={4}ms" -f $t.name, $t.targetHost, $targetTimeoutText, $latThresholdText, $jitThresholdText)
+    }
+}
+else {
+    Write-Host " - none"
+}
+
+if ($runWarnings.Count -gt 0) {
+    Write-Colored "Warnings:" Yellow
+    foreach ($warn in $runWarnings) {
+        Write-Colored (" - {0}" -f $warn) Yellow
+    }
+}
+
+if ($testsToRun.Count -gt 0) {
+    Write-Host ("Tests to run: {0}" -f ($testsToRun -join ', ')) -ForegroundColor Cyan
+}
+else {
+    Write-Colored "No runnable tests for current config. Exiting." Yellow
+    exit 0
+}
+
+$doPingTest = $effectivePingTest
+$doSpeedtest = $effectiveSpeedtest
+$healthChecksEnabled = $effectiveHealthChecks
+
+$userConsent = Read-Host "Press Y to start tests, or any other key to exit"
+if ($userConsent -cne 'Y') {
+    Write-Colored "Run canceled by user." Yellow
+    exit 0
 }
 
 # --- Main Loop ---
@@ -896,7 +1023,11 @@ while ($true) {
             }
 
             $state[$t.targetHost].sent++
-            $ping, $task = Start-PingAsync -targetHost $t.targetHost -timeoutMs $pingTimeoutMs
+            $effectivePingTimeoutMs = $pingTimeoutMs
+            if ($null -ne $t.timeoutMs -and [int]$t.timeoutMs -gt 0) {
+                $effectivePingTimeoutMs = [int]$t.timeoutMs
+            }
+            $ping, $task = Start-PingAsync -targetHost $t.targetHost -timeoutMs $effectivePingTimeoutMs
             $tasks.Add([PSCustomObject]@{ Target = $t; Ping = $ping; Task = $task })
         }
 

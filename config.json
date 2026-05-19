@@ -12,19 +12,63 @@
     "enabled": true,
     "pingIntervalMilSeconds": 50,
     "timeoutMs": 1000,
-    "ignoreGoogleDns": false,
+    "healthChecks": {
+      "enabled": false,
+      "dnsHosts": [
+        {
+          "host": "www.google.com",
+          "enabled": true
+        },
+        {
+          "host": "www.cloudflare.com",
+          "enabled": false
+        }
+      ],
+      "tcpTargets": [
+        {
+          "host": "1.1.1.1",
+          "enabled": false,
+          "port": 443
+        },
+        {
+          "host": "8.8.8.8",
+          "enabled": false,
+          "port": 443
+        }
+      ],
+      "httpUrls": [
+        {
+          "url": "https://www.msftconnecttest.com/connecttest.txt",
+          "enabled": false
+        }
+      ],
+      "tcpTimeoutMs": 2000,
+      "httpTimeoutSeconds": 5
+    },
     "pingTargets": [
       {
+        "name": "Google DNS",
+        "host": "8.8.8.8",
+        "enabled": true,
+        "timeoutMs": 1000,
+        "avgLatencyThresholdMs": 40,
+        "avgJitterThresholdMs": 10
+      },
+      {
         "name": "Cloudflare DNS",
-        "host": "1.1.1.1"
-        ,"avgLatencyThresholdMs": 40
-        ,"avgJitterThresholdMs": 10
+        "host": "1.1.1.1",
+        "enabled": false,
+        "timeoutMs": 1000,
+        "avgLatencyThresholdMs": 40,
+        "avgJitterThresholdMs": 10
       },
       {
         "name": "Home Gateway",
-        "host": "192.168.0.1"
-        ,"avgLatencyThresholdMs": 40
-        ,"avgJitterThresholdMs": 10
+        "host": "192.168.2.1",
+        "enabled": false,
+        "timeoutMs": 1000,
+        "avgLatencyThresholdMs": 40,
+        "avgJitterThresholdMs": 10
       }
     ]
   },
@@ -40,27 +84,5 @@
     "avgJitterThresholdMs": 30,
     "consecutiveBreachSummaries": 2,
     "cooldownSeconds": 600
-  },
-  "healthChecks": {
-    "enabled": true,
-    "dnsHosts": [
-      "www.google.com",
-      "www.cloudflare.com"
-    ],
-    "tcpTargets": [
-      {
-        "host": "1.1.1.1",
-        "port": 443
-      },
-      {
-        "host": "8.8.8.8",
-        "port": 443
-      }
-    ],
-    "httpUrls": [
-      "https://www.msftconnecttest.com/connecttest.txt"
-    ],
-    "tcpTimeoutMs": 2000,
-    "httpTimeoutSeconds": 5
   }
 }
