@@ -10,21 +10,57 @@
   },
   "pingTest": {
     "enabled": true,
-    "pingIntervalMilSeconds": 10,
+    "pingIntervalMilSeconds": 50,
+    "timeoutMs": 1000,
     "ignoreGoogleDns": false,
     "pingTargets": [
       {
         "name": "Cloudflare DNS",
         "host": "1.1.1.1"
+        ,"avgLatencyThresholdMs": 40
+        ,"avgJitterThresholdMs": 10
       },
       {
         "name": "Home Gateway",
         "host": "192.168.2.1"
+        ,"avgLatencyThresholdMs": 40
+        ,"avgJitterThresholdMs": 10
       }
     ]
   },
   "summary": {
     "summaryAfterPings": 100,
-    "delayAfterSummarySeconds": 2
+    "delayAfterSummarySeconds": 2,
+    "jitterEwmaAlpha": 0.2
+  },
+  "incident": {
+    "enabledDiagnostics": true,
+    "lossThresholdPercent": 2,
+    "avgLatencyThresholdMs": 120,
+    "avgJitterThresholdMs": 30,
+    "consecutiveBreachSummaries": 2,
+    "cooldownSeconds": 600
+  },
+  "healthChecks": {
+    "enabled": true,
+    "dnsHosts": [
+      "www.google.com",
+      "www.cloudflare.com"
+    ],
+    "tcpTargets": [
+      {
+        "host": "1.1.1.1",
+        "port": 443
+      },
+      {
+        "host": "8.8.8.8",
+        "port": 443
+      }
+    ],
+    "httpUrls": [
+      "https://www.msftconnecttest.com/connecttest.txt"
+    ],
+    "tcpTimeoutMs": 2000,
+    "httpTimeoutSeconds": 5
   }
 }

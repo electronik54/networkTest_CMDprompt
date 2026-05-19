@@ -35,11 +35,11 @@ function Write-TargetLine {
     $latTag  = Get-RateTag $avgLatency 40 80
     $jitTag  = Get-RateTag $avgJitter  15 30
     $lossTag = Get-RateTag $finalLoss  0  1
-    Write-Host ("{0} ({1}) | T:{2}ms " -f $name, $address, $avgLatency) -NoNewline
+    Write-Host ("{0} ({1}) | Latency:{2}ms " -f $name, $address, $avgLatency) -NoNewline
     Write-Host $latTag.text  -ForegroundColor $latTag.color  -NoNewline
-    Write-Host ("  J:{0}ms " -f $avgJitter) -NoNewline
+    Write-Host ("  Jitter:{0}ms " -f $avgJitter) -NoNewline
     Write-Host $jitTag.text  -ForegroundColor $jitTag.color  -NoNewline
-    Write-Host ("  L:{0}% " -f $finalLoss) -NoNewline
+    Write-Host ("  Loss:{0}% " -f $finalLoss) -NoNewline
     Write-Host $lossTag.text -ForegroundColor $lossTag.color
 }
 
@@ -79,7 +79,6 @@ function Ensure-SpeedtestCli {
 
     try {
         Write-Colored "> speedtest.exe not found. Downloading Speedtest CLI..." Yellow
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         New-Item -ItemType Directory -Force -Path $appToolsDir | Out-Null
 
         $zipPath     = Join-Path $appToolsDir 'speedtest-cli.zip'
@@ -235,6 +234,353 @@ function Start-PingAsync {
     return $ping, $ping.SendPingAsync($targetHost, $timeoutMs)
 }
 
+# Computes a percentile (with linear interpolation) from a pre-sorted numeric array.
+function Get-Percentile {
+    param(
+        [double[]]$SortedValues,
+        [double]$Percentile
+    )
+
+    if ($null -eq $SortedValues -or $SortedValues.Count -eq 0) {
+        return 0.0
+    }
+
+    if ($SortedValues.Count -eq 1) {
+        return [math]::Round($SortedValues[0], 2)
+    }
+
+    $rank  = ($Percentile / 100.0) * ($SortedValues.Count - 1)
+    $lower = [int][math]::Floor($rank)
+    $upper = [int][math]::Ceiling($rank)
+
+    if ($lower -eq $upper) {
+        return [math]::Round($SortedValues[$lower], 2)
+    }
+
+    $weight = $rank - $lower
+    return [math]::Round(($SortedValues[$lower] + (($SortedValues[$upper] - $SortedValues[$lower]) * $weight)), 2)
+}
+
+# Aggregates one target's ring-buffer samples into summary metrics.
+function Get-TargetWindowStats {
+    param($TargetState)
+
+    $latencies = [System.Collections.Generic.List[double]]::new()
+    $jitters   = [System.Collections.Generic.List[double]]::new()
+    $timeoutCount = 0
+
+    for ($i = 0; $i -lt $TargetState.sampleCount; $i++) {
+        if ($TargetState.successRing[$i]) {
+            $lat = [double]$TargetState.latRing[$i]
+            if (-not [double]::IsNaN($lat)) {
+                $latencies.Add($lat)
+            }
+
+            $jit = [double]$TargetState.jitRing[$i]
+            if (-not [double]::IsNaN($jit)) {
+                $jitters.Add($jit)
+            }
+        }
+        else {
+            $timeoutCount++
+        }
+    }
+
+    $avgLatency = 0.0
+    if ($latencies.Count -gt 0) {
+        $latSum = 0.0
+        foreach ($value in $latencies) { $latSum += $value }
+        $avgLatency = [math]::Round(($latSum / $latencies.Count), 2)
+    }
+
+    $avgJitter = 0.0
+    if ($jitters.Count -gt 0) {
+        $jitSum = 0.0
+        foreach ($value in $jitters) { $jitSum += $value }
+        $avgJitter = [math]::Round(($jitSum / $jitters.Count), 2)
+    }
+
+    $p50 = 0.0
+    $p95 = 0.0
+    $p99 = 0.0
+    if ($latencies.Count -gt 0) {
+        $sorted = $latencies.ToArray()
+        [Array]::Sort($sorted)
+        $p50 = Get-Percentile -SortedValues $sorted -Percentile 50
+        $p95 = Get-Percentile -SortedValues $sorted -Percentile 95
+        $p99 = Get-Percentile -SortedValues $sorted -Percentile 99
+    }
+
+    $sentInWindow = [int]$TargetState.sampleCount
+    $loss = if ($sentInWindow -gt 0) { [math]::Round((($timeoutCount / $sentInWindow) * 100), 2) } else { 0.0 }
+
+    return [PSCustomObject]@{
+        AvgLatency     = $avgLatency
+        AvgJitter      = $avgJitter
+        EwmaJitter     = [math]::Round([double]$TargetState.ewmaJitter, 2)
+        P50Latency     = $p50
+        P95Latency     = $p95
+        P99Latency     = $p99
+        FinalLoss      = $loss
+        TimeoutCount   = $timeoutCount
+        SuccessCount   = $latencies.Count
+        SentInWindow   = $sentInWindow
+    }
+}
+
+# Lightweight DNS reachability checks with timing.
+function Invoke-DnsChecks {
+    param([string[]]$Hosts)
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ($null -eq $Hosts) { return $results }
+
+    foreach ($dnsHost in $Hosts) {
+        if ([string]::IsNullOrWhiteSpace($dnsHost)) { continue }
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $addresses = [System.Net.Dns]::GetHostAddresses($dnsHost)
+            $sw.Stop()
+            $results.Add([PSCustomObject]@{
+                Type   = 'DNS'
+                Target = $dnsHost
+                Ok     = ($addresses.Count -gt 0)
+                Ms     = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                Detail = if ($addresses.Count -gt 0) { ($addresses | Select-Object -First 2 | ForEach-Object { $_.ToString() }) -join ', ' } else { 'No addresses returned' }
+            })
+        }
+        catch {
+            $sw.Stop()
+            $results.Add([PSCustomObject]@{
+                Type   = 'DNS'
+                Target = $dnsHost
+                Ok     = $false
+                Ms     = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                Detail = $_.Exception.Message
+            })
+        }
+    }
+
+    return $results
+}
+
+# TCP connect checks to validate application path independently from ICMP.
+function Invoke-TcpChecks {
+    param(
+        [object[]]$Targets,
+        [int]$TimeoutMs = 2000
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ($null -eq $Targets) { return $results }
+
+    foreach ($target in $Targets) {
+        if ($null -eq $target -or [string]::IsNullOrWhiteSpace([string]$target.host)) { continue }
+
+        $tcpHost = [string]$target.host
+        $port = if ($null -ne $target.port -and [int]$target.port -gt 0) { [int]$target.port } else { 443 }
+
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $connectTask = $client.ConnectAsync($tcpHost, $port)
+            if (-not $connectTask.Wait($TimeoutMs)) {
+                throw "Timed out after $TimeoutMs ms"
+            }
+
+            $sw.Stop()
+            $results.Add([PSCustomObject]@{
+                Type   = 'TCP'
+                Target = "$tcpHost`:$port"
+                Ok     = $true
+                Ms     = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                Detail = 'Connected'
+            })
+        }
+        catch {
+            $sw.Stop()
+            $results.Add([PSCustomObject]@{
+                Type   = 'TCP'
+                Target = "$tcpHost`:$port"
+                Ok     = $false
+                Ms     = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                Detail = $_.Exception.Message
+            })
+        }
+        finally {
+            $client.Dispose()
+        }
+    }
+
+    return $results
+}
+
+# HTTP checks to validate endpoint responsiveness from user-space.
+function Invoke-HttpChecks {
+    param(
+        [string[]]$Urls,
+        [int]$TimeoutSeconds = 5
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ($null -eq $Urls) { return $results }
+
+    foreach ($url in $Urls) {
+        if ([string]::IsNullOrWhiteSpace($url)) { continue }
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $response = Invoke-WebRequest -Uri $url -Method Get -TimeoutSec $TimeoutSeconds -UseBasicParsing
+            $sw.Stop()
+            $results.Add([PSCustomObject]@{
+                Type   = 'HTTP'
+                Target = $url
+                Ok     = ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500)
+                Ms     = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                Detail = "Status $($response.StatusCode)"
+            })
+        }
+        catch {
+            $sw.Stop()
+            $results.Add([PSCustomObject]@{
+                Type   = 'HTTP'
+                Target = $url
+                Ok     = $false
+                Ms     = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+                Detail = $_.Exception.Message
+            })
+        }
+    }
+
+    return $results
+}
+
+# Runs all non-ICMP service checks and prints compact one-line results.
+function Invoke-ServiceHealthChecks {
+    param(
+        [string[]]$DnsHosts,
+        [object[]]$TcpTargets,
+        [string[]]$HttpUrls,
+        [int]$TcpTimeoutMs,
+        [int]$HttpTimeoutSeconds
+    )
+
+    $all = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in (Invoke-DnsChecks -Hosts $DnsHosts)) { $all.Add($item) }
+    foreach ($item in (Invoke-TcpChecks -Targets $TcpTargets -TimeoutMs $TcpTimeoutMs)) { $all.Add($item) }
+    foreach ($item in (Invoke-HttpChecks -Urls $HttpUrls -TimeoutSeconds $HttpTimeoutSeconds)) { $all.Add($item) }
+
+    if ($all.Count -eq 0) {
+        Write-Colored "Service checks are enabled, but no DNS/TCP/HTTP targets are configured." Yellow
+        return
+    }
+
+    Write-Host "=== Service Reachability Checks ==="
+    foreach ($r in $all) {
+        $status = if ($r.Ok) { 'OK' } else { 'FAIL' }
+        $color  = if ($r.Ok) { 'Green' } else { 'Red' }
+        Write-Host ("[{0}] {1} | {2}ms | {3} | {4}" -f $r.Type, $r.Target, $r.Ms, $status, $r.Detail) -ForegroundColor $color
+    }
+    Write-Host ""
+}
+
+# Captures additional diagnostics once when an incident begins.
+function Invoke-IncidentDiagnostics {
+    param(
+        $Target,
+        $Stats,
+        [string[]]$DnsHosts,
+        [object[]]$TcpTargets,
+        [string[]]$HttpUrls,
+        [int]$TcpTimeoutMs,
+        [int]$HttpTimeoutSeconds
+    )
+
+    Write-Colored ("> Incident diagnostics started for {0} ({1})" -f $Target.name, $Target.targetHost) Yellow
+    Write-Host ("> Trigger snapshot | Loss:{0}% AvgLatency:{1}ms AvgJitter:{2}ms P95:{3}ms" -f $Stats.FinalLoss, $Stats.AvgLatency, $Stats.AvgJitter, $Stats.P95Latency)
+
+    try {
+        $trace = tracert -d -h 12 $Target.targetHost 2>&1
+        if ($trace) {
+            Write-Host "> Traceroute (first 12 hops):"
+            $trace | ForEach-Object { Write-Host $_ }
+        }
+    }
+    catch {
+        Write-Colored ("> Traceroute failed: {0}" -f $_.Exception.Message) Red
+    }
+
+    Invoke-ServiceHealthChecks -DnsHosts $DnsHosts -TcpTargets $TcpTargets -HttpUrls $HttpUrls -TcpTimeoutMs $TcpTimeoutMs -HttpTimeoutSeconds $HttpTimeoutSeconds
+}
+
+# --- System Requirements Check ---
+function Test-SystemRequirements {
+    $errors   = [System.Collections.Generic.List[string]]::new()
+    $warnings = [System.Collections.Generic.List[string]]::new()
+
+    # 1. Windows-only (tracert, ICMP APIs)
+    $platform = [System.Environment]::OSVersion.Platform
+    if ($platform -ne [System.PlatformID]::Win32NT) {
+        $errors.Add("Windows is required (detected: $platform). Tracert and ICMP diagnostics are Windows-only.")
+    }
+
+    # 2. PowerShell version: 3.0+ mandatory, 5.0+ for speedtest CLI auto-install
+    $psVer = $PSVersionTable.PSVersion
+    if ($psVer.Major -lt 3) {
+        $errors.Add("PowerShell 3.0 or higher is required (detected: $($psVer.ToString())). Install WMF 3.0+ from microsoft.com.")
+    } elseif ($psVer.Major -lt 5) {
+        $warnings.Add("PowerShell 5.0+ is recommended for speedtest CLI auto-install (Expand-Archive). Detected: $($psVer.ToString()). Auto-install will be unavailable.")
+    }
+
+    # 3. .NET CLR 4.0+ — required for Ping.SendPingAsync, Task.WaitAll, TcpClient.ConnectAsync
+    $clr = [System.Environment]::Version
+    if ($clr.Major -lt 4) {
+        $errors.Add(".NET Framework 4.0 or higher is required for async ping and TCP (detected CLR: $($clr.ToString())). Install .NET Framework 4.5+ from microsoft.com.")
+    }
+
+    # Print warnings (non-blocking)
+    foreach ($w in $warnings) {
+        Write-Host "[REQUIREMENT WARNING] $w" -ForegroundColor Yellow
+    }
+    if ($warnings.Count -gt 0) { Write-Host "" }
+
+    # Print errors and exit if any
+    if ($errors.Count -gt 0) {
+        Write-Host "=== System Requirements Check FAILED ===" -ForegroundColor Red
+        foreach ($e in $errors) {
+            Write-Host "[REQUIREMENT ERROR] $e" -ForegroundColor Red
+        }
+        Write-Host ""
+        Write-Host "This script cannot run on the current system. Please resolve the issues above and try again." -ForegroundColor Red
+        exit 1
+    }
+}
+
+Test-SystemRequirements
+
+# Enforce TLS 1.2 globally for all outbound HTTPS (Invoke-WebRequest, speedtest download, etc.)
+# PowerShell 5.1 defaults to TLS 1.0; most modern servers require TLS 1.2+.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Trust all certificates globally using a proper .NET delegate (PS 5.1 compatible).
+# Required when SSL inspection (corporate proxy, antivirus) presents a substitute certificate.
+# Scriptblocks cannot be cast to RemoteCertificateValidationCallback; Add-Type is needed.
+if (-not ([System.Management.Automation.PSTypeName]'NetworkMonitor.TrustAllCerts').Type) {
+    Add-Type @"
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+namespace NetworkMonitor {
+    public class TrustAllCerts {
+        public static RemoteCertificateValidationCallback Callback =
+            delegate(object s, X509Certificate c, X509Chain ch, SslPolicyErrors e) { return true; };
+    }
+}
+"@
+}
+[Net.ServicePointManager]::ServerCertificateValidationCallback = [NetworkMonitor.TrustAllCerts]::Callback
+
 # --- Bootstrap: load config once, deduplicate targets ---
 $cfgResult = Load-Config -path $configPath
 $targets   = $cfgResult.Targets
@@ -261,6 +607,7 @@ $doPingTest           = $true
 $doSpeedtest          = $false
 $monitorInterval      = 60
 $pingIntervalMs       = 1000
+$pingTimeoutMs        = 1000
 $delayAfterSummaryMs  = 2000
 $speedtestServerId = $null
 $speedtestRunOnStart = $false
@@ -268,6 +615,22 @@ $speedtestRateLimitCooldownSeconds = 1800
 $speedtestCliPath = $null
 $speedtestCliDownloadUrl = "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-win64.zip"
 $speedtestAutoInstallCli = $true
+$jitterEwmaAlpha = 0.2
+$healthChecksEnabled = $false
+$healthDnsHosts = @('www.google.com', 'www.cloudflare.com')
+$healthTcpTargets = @(
+    [PSCustomObject]@{ host = '1.1.1.1'; port = 443 },
+    [PSCustomObject]@{ host = '8.8.8.8'; port = 443 }
+)
+$healthHttpUrls = @('https://www.msftconnecttest.com/connecttest.txt')
+$healthTcpTimeoutMs = 2000
+$healthHttpTimeoutSeconds = 5
+$incidentDiagnosticsEnabled = $true
+$incidentLossThresholdPercent = 2.0
+$incidentAvgLatencyThresholdMs = 120.0
+$incidentAvgJitterThresholdMs = 30.0
+$incidentConsecutiveBreachSummaries = 2
+$incidentCooldownSeconds = 600
 if ($null -ne $cfg -and $null -ne $cfg.speedtest) {
     if ($null -ne $cfg.speedtest.enabled) { try { $doSpeedtest = [bool]$cfg.speedtest.enabled } catch {} }
 }
@@ -331,6 +694,13 @@ if ($null -ne $cfg -and $null -ne $cfg.pingTest) {
     if ($null -ne $cfg.pingTest.pingIntervalMilSeconds -and [int]$cfg.pingTest.pingIntervalMilSeconds -ge 0) {
         $pingIntervalMs = [int]$cfg.pingTest.pingIntervalMilSeconds
     }
+    if ($null -ne $cfg.pingTest.timeoutMs -and [int]$cfg.pingTest.timeoutMs -gt 0) {
+        $pingTimeoutMs = [int]$cfg.pingTest.timeoutMs
+    }
+    elseif ($null -ne $cfg.pingTest.pingTimeoutMilSeconds -and [int]$cfg.pingTest.pingTimeoutMilSeconds -gt 0) {
+        # Backward compatibility with alternate key spelling
+        $pingTimeoutMs = [int]$cfg.pingTest.pingTimeoutMilSeconds
+    }
     if ($null -ne $cfg.pingTest.delayAfterSummarySeconds -and [int]$cfg.pingTest.delayAfterSummarySeconds -ge 0) {
         $delayAfterSummaryMs = [int]$cfg.pingTest.delayAfterSummarySeconds * 1000
     }
@@ -387,6 +757,63 @@ elseif ($null -ne $cfg -and $null -ne $cfg.speedTestTarget) {
         $speedtestRateLimitCooldownSeconds = [int]$cfg.speedTestTarget.cooldownAfter429Second
     }
 }
+
+if ($null -ne $cfg -and $null -ne $cfg.healthChecks) {
+    if ($null -ne $cfg.healthChecks.enabled) {
+        try { $healthChecksEnabled = [bool]$cfg.healthChecks.enabled } catch {}
+    }
+    if ($null -ne $cfg.healthChecks.dnsHosts) {
+        $healthDnsHosts = @($cfg.healthChecks.dnsHosts | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+    }
+    if ($null -ne $cfg.healthChecks.tcpTargets) {
+        $parsedTcpTargets = [System.Collections.Generic.List[object]]::new()
+        foreach ($tt in $cfg.healthChecks.tcpTargets) {
+            if ($null -eq $tt -or [string]::IsNullOrWhiteSpace([string]$tt.host)) { continue }
+            $port = if ($null -ne $tt.port -and [int]$tt.port -gt 0) { [int]$tt.port } else { 443 }
+            $parsedTcpTargets.Add([PSCustomObject]@{ host = [string]$tt.host; port = $port })
+        }
+        $healthTcpTargets = $parsedTcpTargets.ToArray()
+    }
+    if ($null -ne $cfg.healthChecks.httpUrls) {
+        $healthHttpUrls = @($cfg.healthChecks.httpUrls | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+    }
+    if ($null -ne $cfg.healthChecks.tcpTimeoutMs -and [int]$cfg.healthChecks.tcpTimeoutMs -gt 0) {
+        $healthTcpTimeoutMs = [int]$cfg.healthChecks.tcpTimeoutMs
+    }
+    if ($null -ne $cfg.healthChecks.httpTimeoutSeconds -and [int]$cfg.healthChecks.httpTimeoutSeconds -gt 0) {
+        $healthHttpTimeoutSeconds = [int]$cfg.healthChecks.httpTimeoutSeconds
+    }
+}
+
+if ($null -ne $cfg -and $null -ne $cfg.incident) {
+    if ($null -ne $cfg.incident.enabledDiagnostics) {
+        try { $incidentDiagnosticsEnabled = [bool]$cfg.incident.enabledDiagnostics } catch {}
+    }
+    elseif ($null -ne $cfg.incident.diagnosticsEnabled) {
+        try { $incidentDiagnosticsEnabled = [bool]$cfg.incident.diagnosticsEnabled } catch {}
+    }
+    if ($null -ne $cfg.incident.lossThresholdPercent -and [double]$cfg.incident.lossThresholdPercent -ge 0) {
+        $incidentLossThresholdPercent = [double]$cfg.incident.lossThresholdPercent
+    }
+    if ($null -ne $cfg.incident.avgLatencyThresholdMs -and [double]$cfg.incident.avgLatencyThresholdMs -ge 0) {
+        $incidentAvgLatencyThresholdMs = [double]$cfg.incident.avgLatencyThresholdMs
+    }
+    if ($null -ne $cfg.incident.avgJitterThresholdMs -and [double]$cfg.incident.avgJitterThresholdMs -ge 0) {
+        $incidentAvgJitterThresholdMs = [double]$cfg.incident.avgJitterThresholdMs
+    }
+    if ($null -ne $cfg.incident.consecutiveBreachSummaries -and [int]$cfg.incident.consecutiveBreachSummaries -gt 0) {
+        $incidentConsecutiveBreachSummaries = [int]$cfg.incident.consecutiveBreachSummaries
+    }
+    if ($null -ne $cfg.incident.cooldownSeconds -and [int]$cfg.incident.cooldownSeconds -gt 0) {
+        $incidentCooldownSeconds = [int]$cfg.incident.cooldownSeconds
+    }
+}
+
+if ($null -ne $cfg -and $null -ne $cfg.summary) {
+    if ($null -ne $cfg.summary.jitterEwmaAlpha -and [double]$cfg.summary.jitterEwmaAlpha -gt 0 -and [double]$cfg.summary.jitterEwmaAlpha -le 1) {
+        $jitterEwmaAlpha = [double]$cfg.summary.jitterEwmaAlpha
+    }
+}
 $cfg = $null   # release parsed JSON
 
 $speedtestExePath = $null
@@ -400,8 +827,10 @@ if ($doSpeedtest) {
 
 $speedtestNextAllowedAt = Get-Date
 
-Write-Colored ("Ping test: {0} | Speedtest: {1} | Summary interval: {2}s | Ping interval: {3}ms | Delay after summary: {4}ms" -f $doPingTest, $doSpeedtest, $monitorInterval, $pingIntervalMs, $delayAfterSummaryMs) Cyan
+Write-Colored ("Ping test: {0} | Speedtest: {1} | Summary after: {2} pings | Ping interval: {3}ms | Ping timeout: {4}ms | Delay after summary: {5}ms" -f $doPingTest, $doSpeedtest, $monitorInterval, $pingIntervalMs, $pingTimeoutMs, $delayAfterSummaryMs) Cyan
 Write-Colored ("Targets: {0}" -f (($targets | ForEach-Object { "{0} ({1})" -f $_.name, $_.targetHost }) -join " - ")) Cyan
+Write-Colored ("Incident diagnostics: {0} | Loss>={1}% Latency>={2}ms Jitter>={3}ms | Consecutive summaries: {4} | Cooldown: {5}s" -f $incidentDiagnosticsEnabled, $incidentLossThresholdPercent, $incidentAvgLatencyThresholdMs, $incidentAvgJitterThresholdMs, $incidentConsecutiveBreachSummaries, $incidentCooldownSeconds) Cyan
+Write-Colored ("Service checks: {0} | DNS:{1} TCP:{2} HTTP:{3}" -f $healthChecksEnabled, $healthDnsHosts.Count, $healthTcpTargets.Count, $healthHttpUrls.Count) Cyan
 if ($doSpeedtest) {
     Write-Colored ("Speedtest trigger: with each displayed summary | Run on start: {0} | Rate-limit cooldown: {1}s" -f $speedtestRunOnStart, $speedtestRateLimitCooldownSeconds) Cyan
     $configuredServerIdText = if (-not [string]::IsNullOrWhiteSpace($speedtestServerId)) { $speedtestServerId } else { 'auto' }
@@ -415,7 +844,7 @@ while ($true) {
     if ($doPingTest) {
 
         if ($counter -eq 0) {
-            Write-Colored "Legends: T:time | J:jitter | L:loss" Cyan
+            Write-Colored "Legends: T=Latency(ms) | J=Jitter(ms) | L=Loss(%)" Cyan
         }
 
         $timestamp = Get-Date -Format "HH:mm:ss"
@@ -430,15 +859,21 @@ while ($true) {
                     sent        = 0
                     recv        = 0
                     lastLatency = $null
-                    # Pre-sized Lists avoid reallocation during normal operation
-                    latHistory  = [System.Collections.Generic.List[double]]::new($monitorInterval)
-                    jitHistory  = [System.Collections.Generic.List[double]]::new($monitorInterval)
-                    lossHistory = [System.Collections.Generic.List[double]]::new($monitorInterval)
+                    ewmaJitter  = 0.0
+                    # Fixed-size ring buffers avoid RemoveAt(0) shifting overhead.
+                    latRing     = New-Object 'double[]' $monitorInterval
+                    jitRing     = New-Object 'double[]' $monitorInterval
+                    successRing = New-Object 'bool[]' $monitorInterval
+                    sampleCursor = 0
+                    sampleCount  = 0
+                    incidentOpen = $false
+                    breachCount = 0
+                    nextIncidentAllowedAt = Get-Date
                 }
             }
 
             $state[$t.targetHost].sent++
-            $ping, $task = Start-PingAsync -targetHost $t.targetHost -timeoutMs 1000
+            $ping, $task = Start-PingAsync -targetHost $t.targetHost -timeoutMs $pingTimeoutMs
             $tasks.Add([PSCustomObject]@{ Target = $t; Ping = $ping; Task = $task })
         }
 
@@ -453,35 +888,50 @@ while ($true) {
             if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
                 $lat  = $reply.RoundtripTime
                 $s.recv++
-                $jit  = if ($null -ne $s.lastLatency) { [math]::Abs($lat - $s.lastLatency) } else { 0 }
+                $jit  = if ($null -ne $s.lastLatency) { [math]::Abs($lat - $s.lastLatency) } else { [double]::NaN }
                 $s.lastLatency = $lat
+
+                if (-not [double]::IsNaN($jit)) {
+                    $s.ewmaJitter = [math]::Round((($jitterEwmaAlpha * $jit) + ((1 - $jitterEwmaAlpha) * [double]$s.ewmaJitter)), 2)
+                }
+
+                $idx = [int]$s.sampleCursor
+                $s.latRing[$idx] = [double]$lat
+                $s.jitRing[$idx] = [double]$jit
+                $s.successRing[$idx] = $true
+                $s.sampleCursor = (($idx + 1) % $monitorInterval)
+                if ($s.sampleCount -lt $monitorInterval) { $s.sampleCount++ }
+
                 $loss = [math]::Round((($s.sent - $s.recv) / $s.sent) * 100, 2)
-                $s.latHistory.Add($lat)
-                $s.jitHistory.Add($jit)
-                $s.lossHistory.Add($loss)
                 $latTag  = Get-RateTag $lat  40 80
-                $jitTag  = Get-RateTag $jit  15 30
                 $lossTag = Get-RateTag $loss  0  1
                 Write-Host "[" -NoNewline
                 Write-Host $t.name -NoNewline
                 Write-Host ("|T:{0}ms" -f $lat)  -ForegroundColor $latTag.color  -NoNewline
-                Write-Host ("|J:{0}ms" -f $jit)  -ForegroundColor $jitTag.color  -NoNewline
+
+                if (-not [double]::IsNaN($jit)) {
+                    $jitTag = Get-RateTag $jit 15 30
+                    Write-Host ("|J:{0}ms" -f $jit) -ForegroundColor $jitTag.color -NoNewline
+                }
+                else {
+                    Write-Host "|J:n/a" -ForegroundColor DarkGray -NoNewline
+                }
+
                 Write-Host ("|L:{0}%]" -f $loss) -ForegroundColor $lossTag.color -NoNewline
             } else {
+                $idx = [int]$s.sampleCursor
+                $s.latRing[$idx] = [double]::NaN
+                $s.jitRing[$idx] = [double]::NaN
+                $s.successRing[$idx] = $false
+                $s.sampleCursor = (($idx + 1) % $monitorInterval)
+                if ($s.sampleCount -lt $monitorInterval) { $s.sampleCount++ }
+
                 $loss = [math]::Round((($s.sent - $s.recv) / $s.sent) * 100, 2)
-                $s.latHistory.Add(999)
-                $s.jitHistory.Add(0)
-                $s.lossHistory.Add($loss)
                 Write-Host ("[{0}|timeout|L:{1}%]" -f $t.name, $loss) -ForegroundColor Red -NoNewline
             }
 
             # Dispose Ping to free the underlying socket immediately
             $entry.Ping.Dispose()
-
-            # Cap history at $monitorInterval entries using RemoveAt (no new array allocation)
-            if ($s.latHistory.Count  -gt $monitorInterval) { $s.latHistory.RemoveAt(0)  }
-            if ($s.jitHistory.Count  -gt $monitorInterval) { $s.jitHistory.RemoveAt(0)  }
-            if ($s.lossHistory.Count -gt $monitorInterval) { $s.lossHistory.RemoveAt(0) }
         }
         Write-Host ""
     }
@@ -495,23 +945,53 @@ while ($true) {
             Write-Host "=== Ping Summary (per gateway) ==="
             foreach ($t in $targets) {
                 $s = $state[$t.targetHost]
-                $avgLatency = if ($s.latHistory.Count  -gt 0) { [math]::Round(($s.latHistory  | Measure-Object -Average).Average, 2) } else { 0 }
-                $avgJitter  = if ($s.jitHistory.Count  -gt 0) { [math]::Round(($s.jitHistory  | Measure-Object -Average).Average, 2) } else { 0 }
-                $finalLoss  = if ($s.lossHistory.Count -gt 0) { $s.lossHistory[$s.lossHistory.Count - 1] } else { 0 }
-                Write-TargetLine $t.name $t.targetHost $avgLatency $avgJitter $finalLoss
+                $stats = Get-TargetWindowStats -TargetState $s
+                Write-TargetLine $t.name $t.targetHost $stats.AvgLatency $stats.AvgJitter $stats.FinalLoss
+
+                Write-Host ("  Percentiles -> P50:{0}ms P95:{1}ms P99:{2}ms | EWMA Jitter:{3}ms | Timeouts:{4}/{5}" -f $stats.P50Latency, $stats.P95Latency, $stats.P99Latency, $stats.EwmaJitter, $stats.TimeoutCount, $stats.SentInWindow)
+
+
+                # Per-target thresholds (override global if present)
+                $latencyThreshold = if ($t.PSObject.Properties["avgLatencyThresholdMs"] -and $t.avgLatencyThresholdMs -ne $null) { [double]$t.avgLatencyThresholdMs } else { $incidentAvgLatencyThresholdMs }
+                $jitterThreshold  = if ($t.PSObject.Properties["avgJitterThresholdMs"] -and $t.avgJitterThresholdMs -ne $null) { [double]$t.avgJitterThresholdMs } else { $incidentAvgJitterThresholdMs }
+
+                $isBreach = (
+                    ($stats.FinalLoss -ge $incidentLossThresholdPercent) -or
+                    ($stats.AvgLatency -ge $latencyThreshold) -or
+                    ($stats.AvgJitter -ge $jitterThreshold)
+                )
+
+                if ($isBreach) {
+                    $s.breachCount++
+                }
+                else {
+                    if ($s.incidentOpen) {
+                        Write-Colored ("> Incident recovered for {0} ({1})" -f $t.name, $t.targetHost) Green
+                    }
+                    $s.breachCount = 0
+                    $s.incidentOpen = $false
+                }
+
+                if (
+                    $incidentDiagnosticsEnabled -and
+                    $isBreach -and
+                    ($s.breachCount -ge $incidentConsecutiveBreachSummaries) -and
+                    (-not $s.incidentOpen) -and
+                    ((Get-Date) -ge $s.nextIncidentAllowedAt)
+                ) {
+                    $s.incidentOpen = $true
+                    $s.nextIncidentAllowedAt = (Get-Date).AddSeconds($incidentCooldownSeconds)
+                    Write-Colored (
+                        "> Incident detected for {0} ({1}) | Breach count: {2}" -f $t.name, $t.targetHost, $s.breachCount
+                    ) Red
+                    Invoke-IncidentDiagnostics -Target $t -Stats $stats -DnsHosts $healthDnsHosts -TcpTargets $healthTcpTargets -HttpUrls $healthHttpUrls -TcpTimeoutMs $healthTcpTimeoutMs -HttpTimeoutSeconds $healthHttpTimeoutSeconds
+                }
             }
 
             Write-Host ""
-            Write-Host "=== Network Stability (per gateway) ==="
-            foreach ($t in $targets) {
-                $s = $state[$t.targetHost]
-                $avgLatency = if ($s.latHistory.Count  -gt 0) { [math]::Round(($s.latHistory  | Measure-Object -Average).Average, 2) } else { 0 }
-                $avgJitter  = if ($s.jitHistory.Count  -gt 0) { [math]::Round(($s.jitHistory  | Measure-Object -Average).Average, 2) } else { 0 }
-                $finalLoss  = if ($s.lossHistory.Count -gt 0) { $s.lossHistory[$s.lossHistory.Count - 1] } else { 0 }
-                Write-TargetLine $t.name $t.targetHost $avgLatency $avgJitter $finalLoss
+            if ($healthChecksEnabled) {
+                Invoke-ServiceHealthChecks -DnsHosts $healthDnsHosts -TcpTargets $healthTcpTargets -HttpUrls $healthHttpUrls -TcpTimeoutMs $healthTcpTimeoutMs -HttpTimeoutSeconds $healthHttpTimeoutSeconds
             }
-
-            Write-Host ""
             Write-Host ""
         }
 
