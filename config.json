@@ -22,7 +22,7 @@
       },
       {
         "name": "Home Gateway",
-        "host": "192.168.2.1"
+        "host": "192.168.0.1"
         ,"avgLatencyThresholdMs": 40
         ,"avgJitterThresholdMs": 10
       }
