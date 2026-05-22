@@ -13,7 +13,7 @@
     "pingIntervalMilSeconds": 50,
     "timeoutMs": 1000,
     "healthChecks": {
-      "enabled": false,
+      "enabled": true,
       "dnsHosts": [
         {
           "host": "www.google.com",
@@ -21,25 +21,25 @@
         },
         {
           "host": "www.cloudflare.com",
-          "enabled": false
+          "enabled": true
         }
       ],
       "tcpTargets": [
         {
           "host": "1.1.1.1",
-          "enabled": false,
+          "enabled": true,
           "port": 443
         },
         {
           "host": "8.8.8.8",
-          "enabled": false,
+          "enabled": true,
           "port": 443
         }
       ],
       "httpUrls": [
         {
           "url": "https://www.msftconnecttest.com/connecttest.txt",
-          "enabled": false
+          "enabled": true
         }
       ],
       "tcpTimeoutMs": 2000,
@@ -47,25 +47,25 @@
     },
     "pingTargets": [
       {
-        "name": "Google DNS",
-        "host": "8.8.8.8",
+        "name": "Home Gateway",
+        "host": "192.168.2.1",
+        "enabled": true,
+        "timeoutMs": 10,
+        "avgLatencyThresholdMs": 5,
+        "avgJitterThresholdMs": 5
+      },
+      {
+        "name": "Cloudflare DNS",
+        "host": "1.1.1.1",
         "enabled": true,
         "timeoutMs": 1000,
         "avgLatencyThresholdMs": 40,
         "avgJitterThresholdMs": 10
       },
       {
-        "name": "Cloudflare DNS",
-        "host": "1.1.1.1",
-        "enabled": false,
-        "timeoutMs": 1000,
-        "avgLatencyThresholdMs": 40,
-        "avgJitterThresholdMs": 10
-      },
-      {
-        "name": "Home Gateway",
-        "host": "192.168.2.1",
-        "enabled": false,
+        "name": "Google DNS",
+        "host": "8.8.8.8",
+        "enabled": true,
         "timeoutMs": 1000,
         "avgLatencyThresholdMs": 40,
         "avgJitterThresholdMs": 10

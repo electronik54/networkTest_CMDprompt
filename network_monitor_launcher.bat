@@ -994,7 +994,7 @@ while ($true) {
     if ($doPingTest) {
 
         if ($counter -eq 0) {
-            Write-Colored "Legends: T=Latency(ms) | J=Jitter(ms) | L=Loss(%)" Cyan
+            Write-Colored "Legends: T=Latency(ms) | J=Jitter(ms) | L=PacketLost(Y/N)" Cyan
         }
 
         $timestamp = Get-Date -Format "HH:mm:ss"
@@ -1056,9 +1056,7 @@ while ($true) {
                 $s.sampleCursor = (($idx + 1) % $monitorInterval)
                 if ($s.sampleCount -lt $monitorInterval) { $s.sampleCount++ }
 
-                $loss = [math]::Round((($s.sent - $s.recv) / $s.sent) * 100, 2)
                 $latTag  = Get-RateTag $lat  40 80
-                $lossTag = Get-RateTag $loss  0  1
                 Write-Host "[" -NoNewline
                 Write-Host $t.name -NoNewline
                 Write-Host ("|T:{0}ms" -f $lat)  -ForegroundColor $latTag.color  -NoNewline
@@ -1071,7 +1069,9 @@ while ($true) {
                     Write-Host "|J:n/a" -ForegroundColor DarkGray -NoNewline
                 }
 
-                Write-Host ("|L:{0}%]" -f $loss) -ForegroundColor $lossTag.color -NoNewline
+                Write-Host "|L:" -NoNewline
+                Write-Host "N" -ForegroundColor Green -NoNewline
+                Write-Host "]" -NoNewline
             } else {
                 $idx = [int]$s.sampleCursor
                 $s.latRing[$idx] = [double]::NaN
@@ -1080,8 +1080,9 @@ while ($true) {
                 $s.sampleCursor = (($idx + 1) % $monitorInterval)
                 if ($s.sampleCount -lt $monitorInterval) { $s.sampleCount++ }
 
-                $loss = [math]::Round((($s.sent - $s.recv) / $s.sent) * 100, 2)
-                Write-Host ("[{0}|timeout|L:{1}%]" -f $t.name, $loss) -ForegroundColor Red -NoNewline
+                Write-Host ("[{0}|T:timeout|J:n/a|L:" -f $t.name) -NoNewline
+                Write-Host "Y" -ForegroundColor Red -NoNewline
+                Write-Host "]" -NoNewline
             }
 
             # Dispose Ping to free the underlying socket immediately
@@ -1100,7 +1101,8 @@ while ($true) {
             foreach ($t in $targets) {
                 $s = $state[$t.targetHost]
                 $stats = Get-TargetWindowStats -TargetState $s
-                Write-TargetLine $t.name $t.targetHost $stats.AvgLatency $stats.AvgJitter $stats.FinalLoss
+                $sessionLoss = if ($s.sent -gt 0) { [math]::Round((($s.sent - $s.recv) / $s.sent) * 100, 2) } else { 0.0 }
+                Write-TargetLine $t.name $t.targetHost $stats.AvgLatency $stats.AvgJitter $sessionLoss
 
                 Write-Host ("  Percentiles -> P50:{0}ms P95:{1}ms P99:{2}ms | EWMA Jitter:{3}ms | Timeouts:{4}/{5}" -f $stats.P50Latency, $stats.P95Latency, $stats.P99Latency, $stats.EwmaJitter, $stats.TimeoutCount, $stats.SentInWindow)
 
